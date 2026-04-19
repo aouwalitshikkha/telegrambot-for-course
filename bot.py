@@ -8,11 +8,12 @@ from html import escape
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -308,6 +309,30 @@ def format_entries(entries: List[Entry], title: str) -> str:
     return "\n".join(lines)
 
 
+def format_entry(entry: Entry, include_id: bool = False) -> str:
+    url_part = (
+        f'<a href="{escape(entry.url, quote=True)}">here</a>'
+        if entry.url
+        else "in the course portal"
+    )
+    id_prefix = ""
+    if include_id:
+        id_prefix = f"<code>{entry.id}</code>. "
+    return (
+        f"{id_prefix}On {format_display_date(entry.entry_date)}, "
+        f"the course <b>{escape(entry.module)}</b> and module <b>{escape(entry.tag)}</b> "
+        f"were updated. You may review it {url_part}."
+    )
+
+
+def delete_entry_keyboard(entry_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Delete This Update", callback_data="delete:{0}".format(entry_id))],
+        ]
+    )
+
+
 def user_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
@@ -421,12 +446,18 @@ async def delete_saved_update(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not context.args:
         entries = fetch_latest(limit=10)
-        await update.message.reply_text(
-            format_entries(entries, "Latest Course Updates"),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        await update.message.reply_text("Usage: /delete ID")
+        if not entries:
+            await update.message.reply_text("No course updates were found.")
+            return
+
+        await update.message.reply_text("Please choose the update you would like to delete.")
+        for entry in entries:
+            await update.message.reply_text(
+                format_entry(entry, include_id=True),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=delete_entry_keyboard(entry.id),
+            )
         return
 
     raw_id = context.args[0]
@@ -442,6 +473,42 @@ async def delete_saved_update(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     delete_update(entry_id)
     await update.message.reply_text(f"Update ID {entry_id} has been deleted.")
+
+
+async def delete_entry_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    remember_subscriber(update)
+    query = update.callback_query
+    if query is None:
+        return
+
+    user = query.from_user
+    if not is_admin(user.id if user else None):
+        await query.answer("Only admins may delete updates.", show_alert=True)
+        return
+
+    raw_data = query.data or ""
+    if not raw_data.startswith("delete:"):
+        await query.answer()
+        return
+
+    entry_id_text = raw_data.split(":", 1)[1]
+    if not entry_id_text.isdigit():
+        await query.answer("Invalid delete request.", show_alert=True)
+        return
+
+    entry_id = int(entry_id_text)
+    entry = fetch_entry_by_id(entry_id)
+    if entry is None:
+        await query.answer("This update was already deleted.", show_alert=True)
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    delete_update(entry_id)
+    await query.answer("Update deleted.")
+    await query.edit_message_text(
+        "This update has been deleted.",
+        reply_markup=None,
+    )
 
 
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -598,6 +665,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Regex(r"^/7days(?:@\w+)?$"), days_7))
     application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_LAST_7_DAYS}$"), days_7))
     application.add_handler(CommandHandler("date", by_date))
+    application.add_handler(CallbackQueryHandler(delete_entry_button, pattern=r"^delete:\d+$"))
     application.add_handler(CommandHandler("delete", delete_saved_update))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(MessageHandler(filters.Regex(f"^{BUTTON_CANCEL}$"), cancel))
